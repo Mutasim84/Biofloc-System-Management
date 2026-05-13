@@ -1,191 +1,402 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import json
+import os
 from datetime import date, timedelta
+import io
 
-# 1. PAGE & BRANDING CONFIG
+# ========================= CONFIGURATION =========================
 st.set_page_config(page_title="Biofloc System Management", layout="wide", page_icon="🧬")
 
+DATA_FILE = "biofloc_data.json"
+
 CARBON_SOURCES = {
-    "Molasses (Liquid)": 0.40, "Cassava Starch": 0.50, "Wheat Flour": 0.45,
-    "Cane Sugar (Sucrose)": 0.42, "Rice Flour": 0.44, "Corn Flour": 0.48
+    "Molasses (Liquid)": 0.40,
+    "Cassava Starch": 0.50,
+    "Wheat Flour": 0.45,
+    "Cane Sugar (Sucrose)": 0.42,
+    "Rice Flour": 0.44,
+    "Corn Flour": 0.48
 }
 
-if 'farm_data' not in st.session_state:
-    st.session_state.farm_data = {}
-
-# --- 2. SMART SCIENTIFIC ADVISOR (TRAFFIC LIGHT SYSTEM) ---
-def scientific_advisor(label, value, ideal_min, ideal_max, danger_min, danger_max, unit=""):
-    """
-    Provides Green (Safe), Yellow (Warning + Advice), or Red (Emergency + Action) feedback.
-    """
-    if ideal_min <= value <= ideal_max:
-        st.success(f"✅ {label}: {value} {unit} (Safe) - Parameters are optimal.")
-    elif (danger_min <= value < ideal_min) or (ideal_max < value <= danger_max):
-        st.warning(f"🟡 {label}: {value} {unit} (Warning) - Suggested Action:")
-        if label == "TAN": st.info("💡 Recommendation: Increase C:N ratio to 18:1; reduce feed intake by 20%.")
-        if label == "DO": st.info("💡 Recommendation: Increase aeration; check for organic waste buildup.")
-        if label == "FV": st.info("💡 Recommendation: Monitor floc density; prepare for water exchange.")
+# ========================= DATA PERSISTENCE (OFFLINE) =========================
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
     else:
-        st.error(f"🚨 {label}: {value} {unit} (Danger) - EMERGENCY ACTION REQUIRED:")
-        if label == "TAN": st.write("🆘 EMERGENCY: Add 20:1 Carbon dose; STOP feeding for 24 hours.")
-        if label == "DO": st.write("🆘 EMERGENCY: Oxygen levels critical! Start backup aerators.")
-        if label == "FV": st.write("🆘 EMERGENCY: High Floc! Discharge 15-20% water from bottom.")
-        if label == "pH": st.write("🆘 EMERGENCY: pH Instability! Buffer with Sodium Bicarbonate.")
+        # Default demo pond
+        demo_pond = {
+            "sector": "Demo",
+            "active": True,
+            "settings": {
+                "vol": 50.0,
+                "target_w": 500,
+                "stock_count": 1000,
+                "mortality": 0,
+                "avg_weight": 50.0
+            },
+            "finance": {"feed_cost": 0.0, "carbon_cost": 0.0, "misc": 0.0},
+            "feed_history": {"total_feed_kg": 0.0, "protein_avg": 30.0, "daily_feed_given": 0.0},
+            "logs": []
+        }
+        return {"D-1": demo_pond}
 
-# --- 3. SIDEBAR: REGISTRATION & NAVIGATION ---
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4, default=str)
+
+if 'farm_data' not in st.session_state:
+    st.session_state.farm_data = load_data()
+
+# ========================= HELPER FUNCTIONS =========================
+def calculate_biomass(stock_count, mortality, avg_weight_g):
+    live_fish = stock_count - mortality
+    return (live_fish * avg_weight_g) / 1000.0
+
+def recommended_daily_feed(biomass_kg, avg_weight_g):
+    if avg_weight_g < 10:
+        rate = 6.0
+    elif avg_weight_g < 100:
+        rate = 4.0
+    else:
+        rate = 2.0
+    return biomass_kg * (rate / 100.0)
+
+def carbon_needed_from_tan(tan_mgL, pond_vol_m3, feed_kg, protein_pct):
+    if tan_mgL < 0.3:
+        target_cn = 12
+    elif tan_mgL < 0.8:
+        target_cn = 15
+    else:
+        target_cn = 20
+    
+    nitrogen_from_feed = feed_kg * (protein_pct / 100) * 0.16
+    tan_kg = (tan_mgL * pond_vol_m3) / 1000.0
+    total_nitrogen = nitrogen_from_feed + tan_kg * 0.82
+    carbon_needed_kg = total_nitrogen * target_cn
+    return carbon_needed_kg, target_cn
+
+def lactobacillus_dose(pond_vol_m3, tan_mgL):
+    if tan_mgL > 0.5:
+        dose_ml_per_m3 = 30.0
+        reason = "therapeutic (high ammonia)"
+    else:
+        dose_ml_per_m3 = 10.0
+        reason = "prophylactic maintenance"
+    total_ml = pond_vol_m3 * dose_ml_per_m3
+    return total_ml / 1000.0, reason
+
+def lactobacillus_materials(volume_liters):
+    rice_kg = volume_liters * 0.1          # 100g rice per liter
+    milk_liters = volume_liters * 0.5      # 500ml milk per liter
+    sugar_kg = volume_liters * 0.05        # 50g sugar per liter
+    water_liters = volume_liters * 0.5     # 500ml water per liter
+    return rice_kg, milk_liters, sugar_kg, water_liters
+
+def scientific_advisor(label, value, ideal_min, ideal_max, danger_min, danger_max, unit=""):
+    if ideal_min <= value <= ideal_max:
+        st.success(f"✅ {label}: {value} {unit} (Safe)")
+    elif (danger_min <= value < ideal_min) or (ideal_max < value <= danger_max):
+        st.warning(f"🟡 {label}: {value} {unit} (Warning)")
+    else:
+        st.error(f"🚨 {label}: {value} {unit} (Danger)")
+
+def export_to_excel():
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Summary sheet
+        summary = []
+        for pid, data in st.session_state.farm_data.items():
+            if not data.get('active', True):
+                continue
+            biomass = calculate_biomass(data['settings']['stock_count'], data['settings']['mortality'], data['settings'].get('avg_weight', 50))
+            summary.append({
+                "Pond ID": pid,
+                "Sector": data['sector'],
+                "Volume (m3)": data['settings'].get('vol', 0),
+                "Stock": data['settings']['stock_count'],
+                "Mortality": data['settings']['mortality'],
+                "Avg Weight (g)": data['settings'].get('avg_weight', 50),
+                "Biomass (kg)": biomass,
+                "Total Feed (kg)": data['feed_history']['total_feed_kg'],
+                "Total Cost": sum(data['finance'].values())
+            })
+        if summary:
+            pd.DataFrame(summary).to_excel(writer, sheet_name="Ponds Summary", index=False)
+        # Logs sheet
+        all_logs = []
+        for pid, data in st.session_state.farm_data.items():
+            for log in data.get('logs', []):
+                all_logs.append({
+                    "Pond ID": pid,
+                    "Date": log['Date'],
+                    "Weight_g": log.get('Weight', 0),
+                    "TAN_mgL": log.get('TAN', 0),
+                    "FV_mlL": log.get('FV', 0),
+                    "Biomass_kg": log.get('Biomass', 0)
+                })
+        if all_logs:
+            pd.DataFrame(all_logs).to_excel(writer, sheet_name="Historical Logs", index=False)
+    output.seek(0)
+    return output
+
+# ========================= SIDEBAR =========================
 with st.sidebar:
     st.header("🚜 Farm Control Center")
     currency = st.selectbox("Currency:", ["SAR", "USD", "EGP"])
     st.divider()
     st.subheader("Register New Pond")
     sec_map = {"Nursery": "N", "Grow-out": "G", "Fattening": "F", "Quarantine": "Q"}
-    sec = st.selectbox("Sector Zone:", list(sec_map.keys()))
+    sector = st.selectbox("Sector Zone:", list(sec_map.keys()))
     num = st.number_input("Pond ID:", min_value=1, step=1)
-    p_id = f"{sec_map[sec]}-{num}"
-    
-    if st.button("Register Pond"):
-        if p_id not in st.session_state.farm_data:
-            st.session_state.farm_data[p_id] = {
-                "sector": sec, "logs": [], 
-                "settings": {"vol": 0.0, "target_w": 500, "stock_count": 1000, "mortality": 0},
+    new_pond_id = f"{sec_map[sector]}-{num}"
+    if st.button("➕ Register Pond"):
+        if new_pond_id not in st.session_state.farm_data:
+            st.session_state.farm_data[new_pond_id] = {
+                "sector": sector,
+                "active": True,
+                "settings": {"vol": 0.0, "target_w": 500, "stock_count": 1000, "mortality": 0, "avg_weight": 50.0},
                 "finance": {"feed_cost": 0.0, "carbon_cost": 0.0, "misc": 0.0},
-                "feed_history": {"total_feed_kg": 0.0, "protein_avg": 30.0}
+                "feed_history": {"total_feed_kg": 0.0, "protein_avg": 30.0, "daily_feed_given": 0.0},
+                "logs": []
             }
-            st.success(f"Pond {p_id} Activated.")
+            save_data(st.session_state.farm_data)
+            st.success(f"Pond {new_pond_id} activated.")
+        else:
+            st.warning("Pond ID already exists.")
+    st.divider()
+    st.subheader("End Pond Cycle")
+    active_ponds_list = [pid for pid, data in st.session_state.farm_data.items() if data.get('active', True)]
+    if active_ponds_list:
+        pond_to_end = st.selectbox("Select pond to delete:", active_ponds_list)
+        if st.button("❌ End Cycle & Delete"):
+            del st.session_state.farm_data[pond_to_end]
+            save_data(st.session_state.farm_data)
+            st.success(f"Pond {pond_to_end} deleted.")
+            st.rerun()
 
-# --- 4. EXECUTIVE DASHBOARD ---
-st.title("📊 Biofloc System Management")
-if st.session_state.farm_data:
-    dash = st.columns(4)
-    total_bio = sum([v['logs'][-1]['Biomass'] if v['logs'] else 0 for v in st.session_state.farm_data.values()])
-    total_exp = sum([sum(v['finance'].values()) for v in st.session_state.farm_data.values()])
-    
-    dash[0].metric("Total Biomass", f"{total_bio:.1f} kg")
-    dash[1].metric("Total Investment", f"{total_exp:,.0f} {currency}")
-    dash[2].metric("Active Ponds", len(st.session_state.farm_data))
-    dash[3].metric("Current Date", str(date.today()))
-
+# ========================= MAIN DASHBOARD =========================
+st.title("📊 Biofloc System Management (Offline)")
+active_ponds = {k:v for k,v in st.session_state.farm_data.items() if v.get('active', True)}
+if active_ponds:
+    total_biomass = sum([calculate_biomass(v['settings']['stock_count'], v['settings']['mortality'], v['settings'].get('avg_weight', 50)) for v in active_ponds.values()])
+    total_cost = sum([sum(v['finance'].values()) for v in active_ponds.values()], 0.0)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Biomass", f"{total_biomass:.1f} kg")
+    c2.metric("Total Investment", f"{total_cost:,.0f} {currency}")
+    c3.metric("Active Ponds", len(active_ponds))
+    c4.metric("Today", str(date.today()))
+else:
+    st.info("No active ponds. Register one from sidebar.")
 st.divider()
 
-# --- 5. POND MANAGEMENT ENGINE ---
-if st.session_state.farm_data:
-    active_id = st.selectbox("🎯 Select Pond to Manage:", sorted(st.session_state.farm_data.keys()))
-    p_ref = st.session_state.farm_data[active_id]
+# ========================= POND MANAGEMENT =========================
+if active_ponds:
+    selected_pond = st.selectbox("🎯 Select Pond to Manage:", sorted(active_ponds.keys()))
+    pond = st.session_state.farm_data[selected_pond]
     
-    tabs = st.tabs(["📐 Setup", "🧪 Water Analysis", "🐟 Growth & Biology", "💡 Carbon Advisor", "🌬️ Aeration", "💰 Finance"])
-
-    # --- TAB 0: Setup ---
+    tabs = st.tabs(["📐 Setup", "🧪 Water Quality", "🐟 Feed & Growth", "💡 Carbon Advisor", "🦠 Probiotic Dose", "💰 Finance", "📊 Logs"])
+    
+    # ---------- TAB 0: Setup ----------
     with tabs[0]:
-        c1, c2 = st.columns(2)
-        shape = c1.radio("Geometry:", ("Circular", "Rectangular"), key=f"sh_{active_id}")
-        if shape == "Circular":
-            r = c1.number_input("Radius (m)", value=3.0)
-            d = c1.number_input("Depth (m)", value=1.2)
-            p_ref['settings']['vol'] = np.pi * (r**2) * d
-        else:
-            p_ref['settings']['vol'] = c1.number_input("Length") * c1.number_input("Width") * c1.number_input("Depth")
-        
-        p_ref['settings']['stock_count'] = c2.number_input("Initial Stock (pcs)", value=1000)
-        p_ref['settings']['target_w'] = c2.number_input("Harvest Target (g)", value=500)
-        p_ref['settings']['mortality'] = c2.number_input("Total Mortalities (pcs)", value=0)
-        st.metric("Pond Volume", f"{p_ref['settings']['vol']:.2f} m³")
-
-    # --- TAB 1: Water Quality ---
+        col1, col2 = st.columns(2)
+        with col1:
+            shape = st.radio("Geometry:", ("Circular", "Rectangular"), key=f"shape_{selected_pond}")
+            if shape == "Circular":
+                r = st.number_input("Radius (m)", 3.0, key=f"rad_{selected_pond}")
+                d = st.number_input("Depth (m)", 1.2, key=f"dep_{selected_pond}")
+                pond['settings']['vol'] = np.pi * r**2 * d
+            else:
+                L = st.number_input("Length (m)", 5.0, key=f"len_{selected_pond}")
+                W = st.number_input("Width (m)", 4.0, key=f"wid_{selected_pond}")
+                D = st.number_input("Depth (m)", 1.2, key=f"dep2_{selected_pond}")
+                pond['settings']['vol'] = L * W * D
+        with col2:
+            pond['settings']['stock_count'] = st.number_input("Initial Stock (pcs)", pond['settings']['stock_count'], key=f"stock_{selected_pond}")
+            pond['settings']['target_w'] = st.number_input("Harvest Target (g)", pond['settings']['target_w'], key=f"target_{selected_pond}")
+            pond['settings']['mortality'] = st.number_input("Total Mortalities (pcs)", pond['settings']['mortality'], key=f"mort_{selected_pond}")
+            pond['settings']['avg_weight'] = st.number_input("Average Weight (g)", pond['settings']['avg_weight'], key=f"avgw_{selected_pond}")
+        st.metric("Pond Volume", f"{pond['settings']['vol']:.2f} m³")
+    
+    # ---------- TAB 1: Water Quality ----------
     with tabs[1]:
-        st.subheader("Water Analysis & Advisor")
-        wc = st.columns(4)
-        temp = wc[0].number_input("Temp (°C)", value=28.0)
-        do = wc[1].number_input("DO (Oxygen)", value=5.5)
-        ph = wc[2].number_input("pH Level", value=7.5)
-        fv = wc[3].number_input("Floc Vol (FV)", value=25.0)
-        
-        nc = st.columns(3)
-        tan = nc[0].number_input("Ammonia (TAN)", value=0.1)
-        no2 = nc[1].number_input("Nitrite (NO2)", value=0.0)
-        alk = nc[2].number_input("Alkalinity", value=150.0)
-
+        st.subheader("Current Water Parameters")
+        cols = st.columns(4)
+        temp = cols[0].number_input("Temp (°C)", 28.0, key=f"temp_{selected_pond}")
+        do = cols[1].number_input("DO (mg/L)", 5.5, key=f"do_{selected_pond}")
+        ph = cols[2].number_input("pH", 7.5, key=f"ph_{selected_pond}")
+        fv = cols[3].number_input("Floc Vol (mL/L)", 25.0, key=f"fv_{selected_pond}")
+        cols2 = st.columns(3)
+        tan = cols2[0].number_input("TAN (mg/L)", 0.1, key=f"tan_{selected_pond}")
+        no2 = cols2[1].number_input("Nitrite (mg/L)", 0.0, key=f"no2_{selected_pond}")
+        alk = cols2[2].number_input("Alkalinity (mg/L)", 150.0, key=f"alk_{selected_pond}")
         st.divider()
         scientific_advisor("DO", do, 5.0, 8.5, 3.5, 12.0, "mg/L")
         scientific_advisor("TAN", tan, 0.0, 0.5, 0.5, 1.2, "mg/L")
-        scientific_advisor("FV", fv, 15.0, 40.0, 5.0, 60.0, "ml/L")
-        scientific_advisor("pH", ph, 7.2, 8.2, 6.5, 9.0)
-
-    # --- TAB 2: Biology (SGR, DGR, FCR, Survival) ---
+        scientific_advisor("FV", fv, 15.0, 40.0, 5.0, 60.0, "mL/L")
+        scientific_advisor("pH", ph, 7.2, 8.2, 6.5, 9.0, "")
+    
+    # ---------- TAB 2: Feed & Growth ----------
     with tabs[2]:
-        st.subheader("Biological Performance")
-        bc1, bc2 = st.columns(2)
-        s_count = bc1.number_input("Sample Count (pcs)", value=30)
-        s_weight = bc2.number_input("Total Sample Weight (g)", value=0.0)
-        avg_w = s_weight / s_count if s_count > 0 else 1
-        
-        # Survival & Biomass
-        surv_rate = ((p_ref['settings']['stock_count'] - p_ref['settings']['mortality']) / p_ref['settings']['stock_count']) * 100
-        biomass = ((p_ref['settings']['stock_count'] - p_ref['settings']['mortality']) * avg_w) / 1000
-        
-        # SGR & DGR Logic
-        dgr, sgr = 0.0, 0.0
-        if p_ref['logs']:
-            last = p_ref['logs'][-1]
-            days = (date.today() - last['Date']).days or 1
-            dgr = (avg_w - last['Weight']) / days
-            sgr = (np.log(avg_w) - np.log(last['Weight'])) / days * 100 if avg_w > 0 else 0
-        
-        # Feed Conversion Ratio (FCR)
-        fcr = p_ref['feed_history']['total_feed_kg'] / biomass if biomass > 0 else 0
-        
-        m_col = st.columns(4)
-        m_col[0].metric("Survival Rate", f"{surv_rate:.1f}%")
-        m_col[1].metric("Current Biomass", f"{biomass:.1f} kg")
-        m_col[2].metric("FCR", f"{fcr:.2f}")
-        m_col[3].metric("Daily Growth (DGR)", f"{dgr:.2f} g/d")
-        
-        days_to_harvest = (p_ref['settings']['target_w'] - avg_w) / (dgr if dgr > 0 else 1.5)
-        st.info(f"📅 Estimated Harvest Date: {date.today() + timedelta(days=int(days_to_harvest))}")
-
-    # --- TAB 3: Carbon Advisor ---
+        st.subheader("Feeding Management")
+        biomass = calculate_biomass(pond['settings']['stock_count'], pond['settings']['mortality'], pond['settings']['avg_weight'])
+        rec_feed = recommended_daily_feed(biomass, pond['settings']['avg_weight'])
+        st.metric("Current Biomass", f"{biomass:.2f} kg")
+        st.metric("Recommended Daily Feed", f"{rec_feed:.2f} kg")
+        feed_given = st.number_input("Actual Feed Given Today (kg)", rec_feed, key=f"feed_given_{selected_pond}")
+        protein_pct = st.number_input("Feed Protein %", 30.0, key=f"prot_{selected_pond}")
+        if st.button("Record Feeding", key=f"rec_feed_{selected_pond}"):
+            pond['feed_history']['total_feed_kg'] += feed_given
+            pond['feed_history']['daily_feed_given'] = feed_given
+            pond['feed_history']['protein_avg'] = protein_pct
+            save_data(st.session_state.farm_data)
+            st.success(f"Recorded {feed_given} kg. Total feed: {pond['feed_history']['total_feed_kg']:.2f} kg")
+        # Growth indicators
+        st.subheader("Growth Performance")
+        if pond['logs']:
+            last_log = pond['logs'][-1]
+            days_diff = (date.today() - last_log['Date']).days or 1
+            dgr = (pond['settings']['avg_weight'] - last_log.get('Weight', pond['settings']['avg_weight'])) / days_diff
+            sgr = (np.log(pond['settings']['avg_weight']) - np.log(last_log.get('Weight', 1))) / days_diff * 100 if pond['settings']['avg_weight'] > 0 else 0
+            fcr = pond['feed_history']['total_feed_kg'] / biomass if biomass > 0 else 0
+            colG1, colG2, colG3 = st.columns(3)
+            colG1.metric("DGR (g/day)", f"{dgr:.2f}")
+            colG2.metric("SGR (%/day)", f"{sgr:.2f}")
+            colG3.metric("FCR", f"{fcr:.2f}")
+    
+    # ---------- TAB 3: Carbon Advisor ----------
     with tabs[3]:
-        st.subheader("C:N Balance Advisor")
-        ratio = 15
-        if tan > 0.8: ratio = 20
-        elif fv < 15: ratio = 18
-        
-        src = st.selectbox("Carbon Source:", list(CARBON_SOURCES.keys()))
-        f_daily = st.number_input("Today's Feed Intake (kg)")
-        prot = st.number_input("Feed Protein %", value=30.0)
-        
-        # Calculation Formula
-        dose = (f_daily * (prot/100) * 0.16 * ratio) / CARBON_SOURCES[src]
-        st.info(f"Apply **{dose:.3f} kg** of {src} to maintain C:N ratio of {ratio}:1")
-
-    # --- TAB 4: Aeration ---
+        st.subheader("Dynamic Carbon Requirement Based on Ammonia")
+        pond_vol = pond['settings']['vol']
+        daily_feed_used = pond['feed_history'].get('daily_feed_given', 0)
+        prot_used = pond['feed_history'].get('protein_avg', 30)
+        carbon_needed, target_cn = carbon_needed_from_tan(tan, pond_vol, daily_feed_used, prot_used)
+        st.info(f"📊 Current TAN: {tan} mg/L → Recommended C:N ratio: **{target_cn}:1**")
+        source = st.selectbox("Carbon Source:", list(CARBON_SOURCES.keys()), key=f"cs_{selected_pond}")
+        source_kg = carbon_needed / CARBON_SOURCES[source]
+        st.success(f"💧 Add **{source_kg:.3f} kg** of {source} to balance ammonia.")
+        if st.button("Log Carbon Addition", key=f"carb_log_{selected_pond}"):
+            pond['finance']['carbon_cost'] += source_kg * 0.5   # hypothetical price
+            save_data(st.session_state.farm_data)
+            st.success("Carbon addition recorded.")
+    
+    # ---------- TAB 4: Probiotic Dose (Lactobacillus) - IMPROVED with exact materials ----------
     with tabs[4]:
-        st.subheader("Aeration Audit")
-        hp = st.number_input("Operational HP", value=1.0)
-        needed_hp = (biomass / 500) * (1.3 if fv > 30 else 1.0)
-        st.metric("Scientific HP Needed", f"{needed_hp:.2f} HP")
-        if hp < needed_hp: st.error("DANGER: Insufficient aeration for current biomass!")
-
-    # --- TAB 5: Finance ---
-    with tabs[5]:
-        st.subheader(f"Economic Tracker ({currency})")
-        new_exp = st.number_input("Add Expense Amount")
-        feed_add = st.number_input("Total Feed Added (kg)", min_value=0.0)
-        if st.button("Update Finance"):
-            p_ref['finance']['misc'] += new_exp
-            p_ref['feed_history']['total_feed_kg'] += feed_add
-            st.success("Financial log updated.")
+        st.subheader("🦠 Lactobacillus Probiotic Preparation")
+        st.markdown("Based on Indonesian method (rice wash + milk fermentation) - YouTube 21 min video")
         
-        st.metric("Total Pond Cost", f"{sum(p_ref['finance'].values()):,.1f} {currency}")
+        method = st.radio("Choose calculation method:", 
+                          ["Amount in Liters (prepare specific volume)", 
+                           "Based on Pond Size (calculate from pond volume)"])
+        
+        if method == "Amount in Liters (prepare specific volume)":
+            target_liters = st.number_input("How many liters of Lactobacillus solution do you want to prepare?", 
+                                            min_value=0.5, value=1.0, step=0.5, key=f"lacto_liters_{selected_pond}")
+            rice, milk, sugar, water = lactobacillus_materials(target_liters)
+            st.info(f"**For {target_liters:.1f} L of active Lactobacillus culture:**")
+            
+        else:  # Based on Pond Size
+            pond_vol = pond['settings']['vol']
+            if pond_vol <= 0:
+                st.warning("⚠️ Pond volume not set. Please go to Setup tab and define pond dimensions first.")
+                rice = milk = sugar = water = 0
+                target_liters = 0
+            else:
+                default_ml_per_m3 = 20.0
+                dose_ml_per_m3 = st.number_input("Recommended dose (ml per m³ of pond water)", 
+                                                  min_value=5.0, max_value=50.0, value=default_ml_per_m3, step=1.0,
+                                                  help="Scientific range: 10-30 ml/m³. Use higher dose (30) for high ammonia.")
+                target_liters = (pond_vol * dose_ml_per_m3) / 1000.0
+                st.info(f"📐 Pond volume: **{pond_vol:.2f} m³** → Recommended dose: **{dose_ml_per_m3} ml/m³** → Total solution needed: **{target_liters:.2f} L**")
+                rice, milk, sugar, water = lactobacillus_materials(target_liters)
+        
+        if target_liters > 0:
+            st.subheader("📦 Raw Materials Required (Exact Quantities)")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("🍚 Rice (or rice flour)", f"{rice:.2f} kg")
+            col2.metric("🥛 Fresh Milk (or reconstituted)", f"{milk:.2f} L")
+            col3.metric("🍬 Sugar (brown or molasses)", f"{sugar:.2f} kg")
+            col4.metric("💧 Clean Water (chlorine-free)", f"{water:.2f} L")
+            
+            with st.expander("🔬 Step-by-Step Preparation Instructions (Indonesian method)"):
+                st.markdown("""
+                **Protocol for Lactobacillus culture (fermented rice wash + milk):**
+                
+                1. **Prepare rice wash:** Wash the required amount of rice with clean water. **Keep the second wash water** (milky white).
+                2. **Mix ingredients:** In a clean glass or plastic container, combine:
+                   - Rice wash water (from step 1)
+                   - Fresh milk
+                   - Sugar (dissolved in a little warm water)
+                   - Additional chlorine-free water
+                3. **Cover loosely:** Cover the container with a clean cloth or paper towel and secure with a rubber band. This allows gases to escape while keeping insects out.
+                4. **Ferment:** Place in a warm, dark place (25-35°C) for **3–7 days**. Do not open during this period.
+                5. **Check for completion:** After fermentation, you will see three layers:
+                   - Top: yellowish liquid (whey) – **this is your probiotic**
+                   - Middle: white curds (protein)
+                   - Bottom: sediment
+                6. **Separate:** Using a clean siphon or filter, collect only the **yellowish liquid (whey)**. This is the active Lactobacillus culture.
+                7. **Storage:** Store in a refrigerator for up to 2 months in a sealed bottle.
+                8. **Application:** 
+                   - **To pond:** Apply the calculated dose directly, diluted 1:20 with pond water.
+                   - **To feed:** Mix 10 ml of culture per 1 kg of feed, let it absorb for 15 minutes before feeding.
+                """)
+            
+            if st.button("📝 Log Probiotic Addition to Pond", key=f"log_prob_{selected_pond}"):
+                if 'probiotic_log' not in pond:
+                    pond['probiotic_log'] = []
+                pond['probiotic_log'].append({
+                    "Date": str(date.today()),
+                    "Volume_Liters": target_liters,
+                    "Method": method,
+                    "Rice_kg": rice,
+                    "Milk_L": milk,
+                    "Sugar_kg": sugar,
+                    "Water_L": water
+                })
+                save_data(st.session_state.farm_data)
+                st.success(f"Probiotic addition of {target_liters:.2f} L logged.")
+        else:
+            st.info("Please set pond volume or enter a positive volume to continue.")
+    
+    # ---------- TAB 5: Finance ----------
+    with tabs[5]:
+        st.subheader(f"Expenses ({currency})")
+        new_exp = st.number_input("Add Expense Amount", 0.0, key=f"exp_{selected_pond}")
+        if st.button("Update Finance", key=f"fin_{selected_pond}"):
+            pond['finance']['misc'] += new_exp
+            save_data(st.session_state.farm_data)
+            st.success("Finance updated.")
+        total_pond_cost = sum(pond['finance'].values())
+        st.metric("Total Pond Cost", f"{total_pond_cost:,.2f} {currency}")
+    
+    # ---------- TAB 6: Logs and Save ----------
+    with tabs[6]:
+        st.subheader("Save Today's Data")
+        if st.button(f"💾 Sync & Save Pond {selected_pond}", key=f"save_{selected_pond}"):
+            pond['logs'].append({
+                "Date": date.today(),
+                "Weight": pond['settings']['avg_weight'],
+                "TAN": tan,
+                "FV": fv,
+                "Biomass": biomass,
+            })
+            save_data(st.session_state.farm_data)
+            st.success("Data saved.")
+        if pond['logs']:
+            df_logs = pd.DataFrame(pond['logs'])
+            st.dataframe(df_logs)
 
-    if st.button(f"💾 SYNC & SAVE POND {active_id}"):
-        p_ref['logs'].append({
-            "Date": date.today(), "Weight": avg_w, "TAN": tan, 
-            "FV": fv, "Biomass": biomass, "SGR": sgr
-        })
-        st.success("All biological and engineering data synchronized.")
-
-# --- 6. EXPORT ---
+# ========================= EXPORT TO EXCEL =========================
 st.divider()
-if st.button("📥 Export Global CSV"):
-    st.write("Preparing farm-wide report...")
+col_btn, _ = st.columns([1, 3])
+with col_btn:
+    if st.button("📎 Export All Data to Excel (Download)"):
+        excel_file = export_to_excel()
+        st.download_button(
+            label="📥 Download Excel File",
+            data=excel_file,
+            file_name=f"biofloc_export_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
