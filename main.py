@@ -5,11 +5,18 @@ import json
 import os
 from datetime import date, timedelta
 import io
+from huggingface_hub import HfApi, Repository
+from datasets import Dataset, DatasetDict
+import tempfile
 
 # ========================= CONFIGURATION =========================
 st.set_page_config(page_title="Biofloc System Management", layout="wide", page_icon="🧬")
 
-DATA_FILE = "biofloc_data.json"
+# Hugging Face settings - يجب تعيين هذه المتغيرات في Secrets
+HF_TOKEN = st.secrets.get("HF_TOKEN", None)  # سيتم تعيينه في Space settings
+REPO_ID = "YOUR_USERNAME/YOUR_DATASET_NAME"  # غيّره إلى اسم المستودع الخاص بك
+
+DATA_FILE = "biofloc_data.json"  # سنستخدمه كنسخة مؤقتة فقط
 
 CARBON_SOURCES = {
     "Molasses (Liquid)": 0.40,
@@ -20,37 +27,76 @@ CARBON_SOURCES = {
     "Corn Flour": 0.48
 }
 
-# ========================= DATA PERSISTENCE (OFFLINE) =========================
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    else:
-        # Default demo pond
-        demo_pond = {
-            "sector": "Demo",
-            "active": True,
-            "settings": {
-                "vol": 50.0,
-                "target_w": 500,
-                "stock_count": 1000,
-                "mortality": 0,
-                "avg_weight": 50.0
-            },
-            "finance": {"feed_cost": 0.0, "carbon_cost": 0.0, "misc": 0.0},
-            "feed_history": {"total_feed_kg": 0.0, "protein_avg": 30.0, "daily_feed_given": 0.0},
-            "logs": []
-        }
-        return {"D-1": demo_pond}
+# ========================= DATA PERSISTENCE (Hugging Face Datasets) =========================
+def load_data_from_hf():
+    """تحميل البيانات من Hugging Face Dataset إذا كان موجوداً، وإلا إنشاء بيانات افتراضية"""
+    if HF_TOKEN is None:
+        st.error("HF_TOKEN not found in secrets. Please add it in Space settings.")
+        return {"D-1": create_demo_pond()}
+    
+    try:
+        from datasets import load_dataset
+        # محاولة تحميل dataset باسم REPO_ID
+        dataset = load_dataset(REPO_ID, split="train", token=HF_TOKEN)
+        if len(dataset) == 0:
+            # لا توجد بيانات، نعيد الافتراضي
+            return {"D-1": create_demo_pond()}
+        # أول صف يحتوي على البيانات المخزنة كـ JSON
+        data_str = dataset[0]["data"]
+        farm_data = json.loads(data_str)
+        return farm_data
+    except Exception as e:
+        st.warning(f"Could not load dataset from HF: {e}. Starting with default demo pond.")
+        return {"D-1": create_demo_pond()}
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4, default=str)
+def save_data_to_hf(farm_data):
+    """حفظ البيانات إلى Hugging Face Dataset"""
+    if HF_TOKEN is None:
+        st.error("Cannot save: HF_TOKEN missing.")
+        return False
+    try:
+        from datasets import Dataset
+        # تحويل البيانات إلى سلسلة JSON
+        data_str = json.dumps(farm_data, default=str)
+        # إنشاء dataset جديد بسجل واحد
+        dataset = Dataset.from_dict({"data": [data_str]})
+        # دفع إلى Hugging Face (يتطلب وجود repo مسبق)
+        dataset.push_to_hub(REPO_ID, token=HF_TOKEN, split="train", private=False)
+        return True
+    except Exception as e:
+        st.error(f"Failed to save to HF: {e}")
+        return False
 
+def create_demo_pond():
+    return {
+        "sector": "Demo",
+        "active": True,
+        "settings": {
+            "vol": 50.0,
+            "target_w": 500,
+            "stock_count": 1000,
+            "mortality": 0,
+            "avg_weight": 50.0
+        },
+        "finance": {"feed_cost": 0.0, "carbon_cost": 0.0, "misc": 0.0},
+        "feed_history": {"total_feed_kg": 0.0, "protein_avg": 30.0, "daily_feed_given": 0.0},
+        "logs": []
+    }
+
+# تحميل البيانات عند بدء التشغيل
 if 'farm_data' not in st.session_state:
-    st.session_state.farm_data = load_data()
+    st.session_state.farm_data = load_data_from_hf()
 
-# ========================= HELPER FUNCTIONS =========================
+def save_data():
+    """دالة مساعدة لحفظ البيانات الحالية إلى HF وتحديث session_state"""
+    success = save_data_to_hf(st.session_state.farm_data)
+    if success:
+        st.success("Data saved permanently to Hugging Face Hub.")
+    else:
+        st.error("Failed to save data remotely. Changes may be lost on restart.")
+    return success
+
+# ========================= HELPER FUNCTIONS (لم تتغير) =========================
 def calculate_biomass(stock_count, mortality, avg_weight_g):
     live_fish = stock_count - mortality
     return (live_fish * avg_weight_g) / 1000.0
@@ -89,10 +135,10 @@ def lactobacillus_dose(pond_vol_m3, tan_mgL):
     return total_ml / 1000.0, reason
 
 def lactobacillus_materials(volume_liters):
-    rice_kg = volume_liters * 0.1          # 100g rice per liter
-    milk_liters = volume_liters * 0.5      # 500ml milk per liter
-    sugar_kg = volume_liters * 0.05        # 50g sugar per liter
-    water_liters = volume_liters * 0.5     # 500ml water per liter
+    rice_kg = volume_liters * 0.1
+    milk_liters = volume_liters * 0.5
+    sugar_kg = volume_liters * 0.05
+    water_liters = volume_liters * 0.5
     return rice_kg, milk_liters, sugar_kg, water_liters
 
 def scientific_advisor(label, value, ideal_min, ideal_max, danger_min, danger_max, unit=""):
@@ -106,7 +152,6 @@ def scientific_advisor(label, value, ideal_min, ideal_max, danger_min, danger_ma
 def export_to_excel():
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Summary sheet
         summary = []
         for pid, data in st.session_state.farm_data.items():
             if not data.get('active', True):
@@ -125,7 +170,6 @@ def export_to_excel():
             })
         if summary:
             pd.DataFrame(summary).to_excel(writer, sheet_name="Ponds Summary", index=False)
-        # Logs sheet
         all_logs = []
         for pid, data in st.session_state.farm_data.items():
             for log in data.get('logs', []):
@@ -142,7 +186,7 @@ def export_to_excel():
     output.seek(0)
     return output
 
-# ========================= SIDEBAR =========================
+# ========================= SIDEBAR (تم تعديل زر الحفظ لاستخدام save_data) =========================
 with st.sidebar:
     st.header("🚜 Farm Control Center")
     currency = st.selectbox("Currency:", ["SAR", "USD", "EGP"])
@@ -162,7 +206,7 @@ with st.sidebar:
                 "feed_history": {"total_feed_kg": 0.0, "protein_avg": 30.0, "daily_feed_given": 0.0},
                 "logs": []
             }
-            save_data(st.session_state.farm_data)
+            save_data()  # حفظ بعد الإضافة
             st.success(f"Pond {new_pond_id} activated.")
         else:
             st.warning("Pond ID already exists.")
@@ -173,12 +217,16 @@ with st.sidebar:
         pond_to_end = st.selectbox("Select pond to delete:", active_ponds_list)
         if st.button("❌ End Cycle & Delete"):
             del st.session_state.farm_data[pond_to_end]
-            save_data(st.session_state.farm_data)
+            save_data()
             st.success(f"Pond {pond_to_end} deleted.")
             st.rerun()
+    
+    # زر إضافي للحفظ اليدوي
+    if st.button("💾 Save all data to cloud (manual)"):
+        save_data()
 
 # ========================= MAIN DASHBOARD =========================
-st.title("📊 Biofloc System Management (Offline)")
+st.title("📊 Biofloc System Management (Persistent on Hugging Face)")
 active_ponds = {k:v for k,v in st.session_state.farm_data.items() if v.get('active', True)}
 if active_ponds:
     total_biomass = sum([calculate_biomass(v['settings']['stock_count'], v['settings']['mortality'], v['settings'].get('avg_weight', 50)) for v in active_ponds.values()])
@@ -251,10 +299,8 @@ if active_ponds:
             pond['feed_history']['total_feed_kg'] += feed_given
             pond['feed_history']['daily_feed_given'] = feed_given
             pond['feed_history']['protein_avg'] = protein_pct
-            save_data(st.session_state.farm_data)
+            save_data()
             st.success(f"Recorded {feed_given} kg. Total feed: {pond['feed_history']['total_feed_kg']:.2f} kg")
-        # Growth indicators
-        st.subheader("Growth Performance")
         if pond['logs']:
             last_log = pond['logs'][-1]
             days_diff = (date.today() - last_log['Date']).days or 1
@@ -278,26 +324,23 @@ if active_ponds:
         source_kg = carbon_needed / CARBON_SOURCES[source]
         st.success(f"💧 Add **{source_kg:.3f} kg** of {source} to balance ammonia.")
         if st.button("Log Carbon Addition", key=f"carb_log_{selected_pond}"):
-            pond['finance']['carbon_cost'] += source_kg * 0.5   # hypothetical price
-            save_data(st.session_state.farm_data)
+            pond['finance']['carbon_cost'] += source_kg * 0.5
+            save_data()
             st.success("Carbon addition recorded.")
     
-    # ---------- TAB 4: Probiotic Dose (Lactobacillus) - IMPROVED with exact materials ----------
+    # ---------- TAB 4: Probiotic Dose (Lactobacillus) ----------
     with tabs[4]:
         st.subheader("🦠 Lactobacillus Probiotic Preparation")
         st.markdown("Based on Indonesian method (rice wash + milk fermentation) - YouTube 21 min video")
-        
         method = st.radio("Choose calculation method:", 
                           ["Amount in Liters (prepare specific volume)", 
                            "Based on Pond Size (calculate from pond volume)"])
-        
         if method == "Amount in Liters (prepare specific volume)":
             target_liters = st.number_input("How many liters of Lactobacillus solution do you want to prepare?", 
                                             min_value=0.5, value=1.0, step=0.5, key=f"lacto_liters_{selected_pond}")
             rice, milk, sugar, water = lactobacillus_materials(target_liters)
             st.info(f"**For {target_liters:.1f} L of active Lactobacillus culture:**")
-            
-        else:  # Based on Pond Size
+        else:
             pond_vol = pond['settings']['vol']
             if pond_vol <= 0:
                 st.warning("⚠️ Pond volume not set. Please go to Setup tab and define pond dimensions first.")
@@ -311,7 +354,6 @@ if active_ponds:
                 target_liters = (pond_vol * dose_ml_per_m3) / 1000.0
                 st.info(f"📐 Pond volume: **{pond_vol:.2f} m³** → Recommended dose: **{dose_ml_per_m3} ml/m³** → Total solution needed: **{target_liters:.2f} L**")
                 rice, milk, sugar, water = lactobacillus_materials(target_liters)
-        
         if target_liters > 0:
             st.subheader("📦 Raw Materials Required (Exact Quantities)")
             col1, col2, col3, col4 = st.columns(4)
@@ -319,30 +361,22 @@ if active_ponds:
             col2.metric("🥛 Fresh Milk (or reconstituted)", f"{milk:.2f} L")
             col3.metric("🍬 Sugar (brown or molasses)", f"{sugar:.2f} kg")
             col4.metric("💧 Clean Water (chlorine-free)", f"{water:.2f} L")
-            
             with st.expander("🔬 Step-by-Step Preparation Instructions (Indonesian method)"):
                 st.markdown("""
                 **Protocol for Lactobacillus culture (fermented rice wash + milk):**
-                
                 1. **Prepare rice wash:** Wash the required amount of rice with clean water. **Keep the second wash water** (milky white).
                 2. **Mix ingredients:** In a clean glass or plastic container, combine:
                    - Rice wash water (from step 1)
                    - Fresh milk
                    - Sugar (dissolved in a little warm water)
                    - Additional chlorine-free water
-                3. **Cover loosely:** Cover the container with a clean cloth or paper towel and secure with a rubber band. This allows gases to escape while keeping insects out.
-                4. **Ferment:** Place in a warm, dark place (25-35°C) for **3–7 days**. Do not open during this period.
-                5. **Check for completion:** After fermentation, you will see three layers:
-                   - Top: yellowish liquid (whey) – **this is your probiotic**
-                   - Middle: white curds (protein)
-                   - Bottom: sediment
-                6. **Separate:** Using a clean siphon or filter, collect only the **yellowish liquid (whey)**. This is the active Lactobacillus culture.
-                7. **Storage:** Store in a refrigerator for up to 2 months in a sealed bottle.
-                8. **Application:** 
-                   - **To pond:** Apply the calculated dose directly, diluted 1:20 with pond water.
-                   - **To feed:** Mix 10 ml of culture per 1 kg of feed, let it absorb for 15 minutes before feeding.
+                3. **Cover loosely:** Cover with a clean cloth or paper towel and secure with a rubber band.
+                4. **Ferment:** Place in a warm, dark place (25-35°C) for **3–7 days**.
+                5. **Check for completion:** You will see three layers: top yellowish liquid (whey) – **this is your probiotic**.
+                6. **Separate:** Collect only the yellowish liquid (whey).
+                7. **Storage:** Refrigerate for up to 2 months.
+                8. **Application:** Dilute 1:20 with pond water or mix 10 ml per 1 kg of feed.
                 """)
-            
             if st.button("📝 Log Probiotic Addition to Pond", key=f"log_prob_{selected_pond}"):
                 if 'probiotic_log' not in pond:
                     pond['probiotic_log'] = []
@@ -355,7 +389,7 @@ if active_ponds:
                     "Sugar_kg": sugar,
                     "Water_L": water
                 })
-                save_data(st.session_state.farm_data)
+                save_data()
                 st.success(f"Probiotic addition of {target_liters:.2f} L logged.")
         else:
             st.info("Please set pond volume or enter a positive volume to continue.")
@@ -366,7 +400,7 @@ if active_ponds:
         new_exp = st.number_input("Add Expense Amount", 0.0, key=f"exp_{selected_pond}")
         if st.button("Update Finance", key=f"fin_{selected_pond}"):
             pond['finance']['misc'] += new_exp
-            save_data(st.session_state.farm_data)
+            save_data()
             st.success("Finance updated.")
         total_pond_cost = sum(pond['finance'].values())
         st.metric("Total Pond Cost", f"{total_pond_cost:,.2f} {currency}")
@@ -382,7 +416,7 @@ if active_ponds:
                 "FV": fv,
                 "Biomass": biomass,
             })
-            save_data(st.session_state.farm_data)
+            save_data()
             st.success("Data saved.")
         if pond['logs']:
             df_logs = pd.DataFrame(pond['logs'])
